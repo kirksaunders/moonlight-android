@@ -227,6 +227,8 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             System.err.println(str);
 
             String host = Game.this.getIntent().getStringExtra(EXTRA_HOST);
+            int port = Game.this.getIntent().getIntExtra(EXTRA_PORT, NvHTTP.DEFAULT_HTTP_PORT);
+            int httpsPort = Game.this.getIntent().getIntExtra(EXTRA_HTTPS_PORT, 0);
             InetAddress hostAddr;
             try {
                 hostAddr = InetAddress.getByName(host);
@@ -253,7 +255,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
                 try {
                     // Close connection gracefully
-                    NvHTTP httpConn = new NvHTTP(host, uuid, finalServerCert, PlatformBinding.getCryptoProvider(this));
+                    NvHTTP httpConn = new NvHTTP(new ComputerDetails.AddressTuple(host, port),
+                            httpsPort, uuid, finalServerCert,
+                            PlatformBinding.getCryptoProvider(this));
                     httpConn.quitApp();
 
                     // Close the app
