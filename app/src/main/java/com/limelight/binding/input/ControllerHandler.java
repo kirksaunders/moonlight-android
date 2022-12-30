@@ -9,7 +9,8 @@ import android.hardware.usb.UsbManager;
 import android.media.AudioAttributes;
 import android.os.Build;
 import android.os.CombinedVibration;
-import android.os.SystemClock;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
@@ -35,8 +36,6 @@ import com.limelight.utils.Vector2d;
 import org.cgutman.shieldcontrollerextensions.SceManager;
 
 import java.lang.reflect.InvocationTargetException;
-import java.util.Timer;
-import java.util.TimerTask;
 
 public class ControllerHandler implements InputManager.InputDeviceListener, UsbDriverListener {
 
@@ -48,9 +47,6 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
 
     private static final int EMULATING_SPECIAL = 0x1;
     private static final int EMULATING_SELECT = 0x2;
-
-    private static final int EMULATED_SPECIAL_UP_DELAY_MS = 100;
-    private static final int EMULATED_SELECT_UP_DELAY_MS = 30;
 
     private final Vector2d inputVector = new Vector2d();
 
@@ -64,6 +60,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
     private final GameGestures gestures;
     private final Vibrator deviceVibrator;
     private final SceManager sceManager;
+    private final Handler handler;
     private boolean hasGameController;
 
     private final PreferenceConfiguration prefConfig;
@@ -75,6 +72,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         this.gestures = gestures;
         this.prefConfig = prefConfig;
         this.deviceVibrator = (Vibrator) activityContext.getSystemService(Context.VIBRATOR_SERVICE);
+        this.handler = new Handler(Looper.getMainLooper());
 
         this.sceManager = new SceManager(activityContext);
         this.sceManager.start();
@@ -520,9 +518,6 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
             context.vendorId = dev.getVendorId();
             context.productId = dev.getProductId();
-            if (context.vendorId == 0x2dc8 && context.productId == 0x2100) {
-                context.is8BitdoSn30Xcloud = true;
-            }
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && hasDualAmplitudeControlledRumbleVibrators(dev.getVibratorManager())) {
@@ -571,16 +566,6 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             // Others use THROTTLE and BRAKE (like Xiaomi)
             context.leftTriggerAxis = MotionEvent.AXIS_BRAKE;
             context.rightTriggerAxis = MotionEvent.AXIS_THROTTLE;
-        }
-        else if (context.is8BitdoSn30Xcloud) 
-        {
-            // Specific configs for 8BitDo SN30 Pro for Xbox
-            context.leftTriggerAxis = MotionEvent.AXIS_RX;
-            context.rightTriggerAxis = MotionEvent.AXIS_RY;
-            context.triggersIdleNegative = false;
-            context.triggerDeadzone = 0.30f;
-            context.hasSelect = true;
-            context.hasMode = true;
         }
         else
         {
@@ -941,14 +926,6 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         // Override mode button for 8BitDo controllers
         if (context.vendorId == 0x2dc8 && event.getScanCode() == 306) {
             return KeyEvent.KEYCODE_BUTTON_MODE;
-        }
-        // Override select button for 8BitDo SN30 Pro for Xbox
-        if (context.is8BitdoSn30Xcloud) {
-            switch(event.getScanCode()) {
-                case 312:
-                    return KeyEvent.KEYCODE_BUTTON_SELECT;
-                default:
-            }
         }
 
         // This mapping was adding in Android 10, then changed based on
@@ -1317,28 +1294,6 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         }
     }
 
-    private void toggleMouseEmulation(final GenericControllerContext context) {
-        if (context.mouseEmulationTimer != null) {
-            context.mouseEmulationTimer.cancel();
-            context.mouseEmulationTimer = null;
-        }
-
-        context.mouseEmulationActive = !context.mouseEmulationActive;
-        Toast.makeText(activityContext, "Mouse emulation is: " + (context.mouseEmulationActive ? "ON" : "OFF"), Toast.LENGTH_SHORT).show();
-
-        if (context.mouseEmulationActive) {
-            context.mouseEmulationTimer = new Timer();
-            context.mouseEmulationTimer.schedule(new TimerTask() {
-                @Override
-                public void run() {
-                    // Send mouse movement events from analog sticks
-                    sendEmulatedMouseEvent(context.leftStickX, context.leftStickY);
-                    sendEmulatedMouseEvent(context.rightStickX, context.rightStickY);
-                }
-            }, 50, 50);
-        }
-    }
-
     @TargetApi(31)
     private boolean hasDualAmplitudeControlledRumbleVibrators(VibratorManager vm) {
         int[] vibratorIds = vm.getVibratorIds();
@@ -1527,12 +1482,13 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         // If the button hasn't been down long enough, sleep for a bit before sending the up event
         // This allows "instant" button presses (like OUYA's virtual menu button) to work. This
         // path should not be triggered during normal usage.
-        if (SystemClock.uptimeMillis() - event.getDownTime() < ControllerHandler.MINIMUM_BUTTON_DOWN_TIME_MS)
+        int buttonDownTime = (int)(event.getEventTime() - event.getDownTime());
+        if (buttonDownTime < ControllerHandler.MINIMUM_BUTTON_DOWN_TIME_MS)
         {
-            // Since our sleep time is so short (10 ms), it shouldn't cause a problem doing this in the
-            // UI thread.
+            // Since our sleep time is so short (<= 25 ms), it shouldn't cause a problem doing this
+            // in the UI thread.
             try {
-                Thread.sleep(ControllerHandler.MINIMUM_BUTTON_DOWN_TIME_MS);
+                Thread.sleep(ControllerHandler.MINIMUM_BUTTON_DOWN_TIME_MS - buttonDownTime);
             } catch (InterruptedException e) {
                 e.printStackTrace();
 
@@ -1553,9 +1509,9 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             // Make sure it's real by checking that the key is actually down before taking
             // any action.
             if ((context.inputMap & ControllerPacket.PLAY_FLAG) != 0 &&
-                    SystemClock.uptimeMillis() - context.startDownTime > ControllerHandler.START_DOWN_TIME_MOUSE_MODE_MS &&
+                    event.getEventTime() - context.startDownTime > ControllerHandler.START_DOWN_TIME_MOUSE_MODE_MS &&
                     prefConfig.mouseEmulation) {
-                toggleMouseEmulation(context);
+                context.toggleMouseEmulation();
             }
             context.inputMap &= ~ControllerPacket.PLAY_FLAG;
             break;
@@ -1606,11 +1562,11 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             break;
         case KeyEvent.KEYCODE_BUTTON_L1:
             context.inputMap &= ~ControllerPacket.LB_FLAG;
-            context.lastLbUpTime = SystemClock.uptimeMillis();
+            context.lastLbUpTime = event.getEventTime();
             break;
         case KeyEvent.KEYCODE_BUTTON_R1:
             context.inputMap &= ~ControllerPacket.RB_FLAG;
-            context.lastRbUpTime = SystemClock.uptimeMillis();
+            context.lastRbUpTime = event.getEventTime();
             break;
         case KeyEvent.KEYCODE_BUTTON_THUMBL:
             context.inputMap &= ~ControllerPacket.LS_CLK_FLAG;
@@ -1646,17 +1602,6 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
                 context.inputMap &= ~ControllerPacket.BACK_FLAG;
 
                 context.emulatingButtonFlags &= ~ControllerHandler.EMULATING_SELECT;
-
-                try {
-                    Thread.sleep(EMULATED_SELECT_UP_DELAY_MS);
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
-
-                    // InterruptedException clears the thread's interrupt status. Since we can't
-                    // handle that here, we will re-interrupt the thread to set the interrupt
-                    // status back to true.
-                    Thread.currentThread().interrupt();
-                }
             }
         }
 
@@ -1671,17 +1616,6 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
                 context.inputMap &= ~ControllerPacket.SPECIAL_BUTTON_FLAG;
 
                 context.emulatingButtonFlags &= ~ControllerHandler.EMULATING_SPECIAL;
-
-                try {
-                    Thread.sleep(EMULATED_SPECIAL_UP_DELAY_MS);
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
-
-                    // InterruptedException clears the thread's interrupt status. Since we can't
-                    // handle that here, we will re-interrupt the thread to set the interrupt
-                    // status back to true.
-                    Thread.currentThread().interrupt();
-                }
             }
         }
 
@@ -1719,7 +1653,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         case KeyEvent.KEYCODE_BUTTON_START:
         case KeyEvent.KEYCODE_MENU:
             if (event.getRepeatCount() == 0) {
-                context.startDownTime = SystemClock.uptimeMillis();
+                context.startDownTime = event.getEventTime();
             }
             context.inputMap |= ControllerPacket.PLAY_FLAG;
             break;
@@ -1810,7 +1744,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         if (!context.hasSelect) {
             if (context.inputMap == (ControllerPacket.PLAY_FLAG | ControllerPacket.LB_FLAG) ||
                     (context.inputMap == ControllerPacket.PLAY_FLAG &&
-                            SystemClock.uptimeMillis() - context.lastLbUpTime <= MAXIMUM_BUMPER_UP_DELAY_MS))
+                            event.getEventTime() - context.lastLbUpTime <= MAXIMUM_BUMPER_UP_DELAY_MS))
             {
                 context.inputMap &= ~(ControllerPacket.PLAY_FLAG | ControllerPacket.LB_FLAG);
                 context.inputMap |= ControllerPacket.BACK_FLAG;
@@ -1833,7 +1767,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             else {
                 if (context.inputMap == (ControllerPacket.PLAY_FLAG | ControllerPacket.RB_FLAG) ||
                         (context.inputMap == ControllerPacket.PLAY_FLAG &&
-                                SystemClock.uptimeMillis() - context.lastRbUpTime <= MAXIMUM_BUMPER_UP_DELAY_MS))
+                                event.getEventTime() - context.lastRbUpTime <= MAXIMUM_BUMPER_UP_DELAY_MS))
                 {
                     context.inputMap &= ~(ControllerPacket.PLAY_FLAG | ControllerPacket.RB_FLAG);
                     context.inputMap |= ControllerPacket.SPECIAL_BUTTON_FLAG;
@@ -1924,7 +1858,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         usbDeviceContexts.put(controller.getControllerId(), context);
     }
 
-    static class GenericControllerContext {
+    class GenericControllerContext {
         public int id;
         public boolean external;
 
@@ -1948,14 +1882,38 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         public short leftStickY = 0x0000;
 
         public boolean mouseEmulationActive;
-        public Timer mouseEmulationTimer;
         public short mouseEmulationLastInputMap;
+        public final int mouseEmulationReportPeriod = 50;
+
+        public final Runnable mouseEmulationRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (!mouseEmulationActive) {
+                    return;
+                }
+
+                // Send mouse movement events from analog sticks
+                sendEmulatedMouseEvent(leftStickX, leftStickY);
+                sendEmulatedMouseEvent(rightStickX, rightStickY);
+
+                // Requeue the callback
+                handler.postDelayed(this, mouseEmulationReportPeriod);
+            }
+        };
+
+        public void toggleMouseEmulation() {
+            handler.removeCallbacks(mouseEmulationRunnable);
+            mouseEmulationActive = !mouseEmulationActive;
+            Toast.makeText(activityContext, "Mouse emulation is: " + (mouseEmulationActive ? "ON" : "OFF"), Toast.LENGTH_SHORT).show();
+
+            if (mouseEmulationActive) {
+                handler.postDelayed(mouseEmulationRunnable, mouseEmulationReportPeriod);
+            }
+        }
 
         public void destroy() {
-            if (mouseEmulationTimer != null) {
-                mouseEmulationTimer.cancel();
-                mouseEmulationTimer = null;
-            }
+            mouseEmulationActive = false;
+            handler.removeCallbacks(mouseEmulationRunnable);
         }
     }
 
@@ -1981,7 +1939,6 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         public boolean hatXAxisUsed, hatYAxisUsed;
 
         public boolean isNonStandardDualShock4;
-        public boolean is8BitdoSn30Xcloud;
         public boolean usesLinuxGamepadStandardFaceButtons;
         public boolean isNonStandardXboxBtController;
         public boolean isServal;
