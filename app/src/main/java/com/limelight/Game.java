@@ -22,6 +22,7 @@ import com.limelight.nvstream.NvConnectionListener;
 import com.limelight.nvstream.StreamConfiguration;
 import com.limelight.nvstream.http.ComputerDetails;
 import com.limelight.nvstream.http.NvApp;
+import com.limelight.nvstream.http.NvHTTP;
 import com.limelight.nvstream.input.KeyboardPacket;
 import com.limelight.nvstream.input.MouseButtonPacket;
 import com.limelight.nvstream.jni.MoonBridge;
@@ -78,9 +79,15 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.xmlpull.v1.XmlPullParserException;
+
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.net.DatagramPacket;
+import java.net.InetAddress;
+import java.net.MulticastSocket;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
@@ -108,6 +115,11 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     private static final int STYLUS_UP_DEAD_ZONE_RADIUS = 50;
 
     private static final int THREE_FINGER_TAP_THRESHOLD = 300;
+
+    private static final String MULTICAST_ADDRESS = "228.192.241.65";
+    private static final int MULTICAST_PORT = 23898;
+    private static final int MULTICAST_INTERVAL = 1000; // in ms
+    private static final String TERMINATION_STRING = "CloseNvStream";
 
     private ControllerHandler controllerHandler;
     private KeyboardTranslator keyboardTranslator;
@@ -176,6 +188,87 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     public static final String EXTRA_PC_NAME = "PcName";
     public static final String EXTRA_APP_HDR = "HDR";
     public static final String EXTRA_SERVER_CERT = "ServerCert";
+
+    private volatile boolean exitSignalStopFlag = false;
+    private Thread exitSignalThread = null;
+
+    private final Runnable exitSignalHandler = () -> {
+        InetAddress group;
+        try {
+            group = InetAddress.getByName(MULTICAST_ADDRESS);
+        } catch (java.net.UnknownHostException ex) {
+            return;
+        }
+
+        MulticastSocket sock;
+        try {
+            sock = new MulticastSocket(MULTICAST_PORT);
+            sock.setSoTimeout(MULTICAST_INTERVAL);
+            sock.joinGroup(group);
+        } catch (java.io.IOException ex) {
+            return;
+        }
+
+        while (!exitSignalStopFlag) {
+            byte[] buf = new byte[100];
+            DatagramPacket packet = new DatagramPacket(buf, buf.length);
+
+            try {
+                sock.receive(packet);
+            } catch (java.io.IOException ignored) {
+                continue;
+            }
+
+            // String that was sent was null-terminated, but java strings are not.
+            String str = new String(buf, 0, packet.getLength() - 1);
+            System.err.println("Received data from: " + packet.getAddress().toString() +
+                    ":" + packet.getPort() + " with length: " +
+                    packet.getLength());
+            System.err.println(str);
+
+            String host = Game.this.getIntent().getStringExtra(EXTRA_HOST);
+            InetAddress hostAddr;
+            try {
+                hostAddr = InetAddress.getByName(host);
+            } catch (java.net.UnknownHostException ignored) {
+                continue;
+            }
+
+            if (hostAddr.equals(packet.getAddress()) && str.equals(TERMINATION_STRING)) {
+                System.err.println("Closing stream due to exit signal received");
+
+                String uuid = Game.this.getIntent().getStringExtra(EXTRA_UNIQUEID);
+                byte[] derCertData = Game.this.getIntent().getByteArrayExtra(EXTRA_SERVER_CERT);
+
+                X509Certificate serverCert = null;
+                try {
+                    if (derCertData != null) {
+                        serverCert = (X509Certificate) CertificateFactory.getInstance("X.509")
+                                .generateCertificate(new ByteArrayInputStream(derCertData));
+                    }
+                } catch (CertificateException e) {
+                    e.printStackTrace();
+                }
+                X509Certificate finalServerCert = serverCert;
+
+                try {
+                    // Close connection gracefully
+                    NvHTTP httpConn = new NvHTTP(host, uuid, finalServerCert, PlatformBinding.getCryptoProvider(this));
+                    httpConn.quitApp();
+
+                    // Close the app
+                    finishAffinity();
+                } catch (IOException | XmlPullParserException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+
+        try {
+            sock.leaveGroup(group);
+        } catch (java.io.IOException ignored) {
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -509,6 +602,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         // The connection will be started when the surface gets created
         streamView.getHolder().addCallback(this);
+
+        exitSignalThread = new Thread(this.exitSignalHandler);
+        exitSignalThread.start();
     }
 
     @Override
@@ -974,6 +1070,15 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         // Destroy the capture provider
         inputCaptureProvider.destroy();
+
+        // Stop and join exitSignalHandler thread
+        exitSignalStopFlag = true;
+        if (exitSignalThread != null) {
+            try {
+                exitSignalThread.join();
+            } catch (java.lang.InterruptedException ignored) {
+            }
+        }
     }
 
     @Override
